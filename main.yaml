@@ -1,0 +1,688 @@
+# ==============================================================================
+# GeekMagic SmallTV Pro — Standalone "Bus Buddy" Singapore Bus Arrival Display
+# Platform: ESPHome 2025.5.2 (ESP32, 8 MB Flash, ST7789V 240x240 TFT, Touch Btn)
+# API: Singapore LTA DataMall Bus Arrival API v3
+#      https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival
+#
+# DEFAULT BUS STOPS (Editable & Saved Persistently via Web UI):
+#   - Stop 1: "11541 - Opp Queens"
+#   - Stop 2: "11029 - Mei Chin Rd"
+#   - Stop 3: "11131 - Queens Condo"
+#
+# DISPLAY LAYOUTS:
+#   - Single Bus at Stop (1 service): Giant Hero View (40pt bus no, 44pt 1st ETA,
+#     34pt 2nd ETA side-by-side) for across-the-room readability.
+#   - Multiple Buses (2+ services):   3 buses per page with large 28pt/26pt fonts.
+#
+# TOUCH BUTTON CONTROLS (GPIO32 — Auto-Calibrating Adaptive Baseline):
+#   - Short Press (80ms–650ms): Cycle across pages (3 buses/page) in current stop
+#   - Long Press (>=650ms):     Cycle across Bus Stops 1 -> 2 -> 3
+# ==============================================================================
+
+substitutions:
+  device_name: sg-bus-buddy
+  friendly_name: "SG Bus Buddy"
+  default_stop_1: "11541 - Opp Queens"
+  default_stop_2: "11029 - Mei Chin Rd"
+  default_stop_3: "11131 - Queens Condo"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      - light.turn_on:
+          id: backlight
+          brightness: 80%
+      - component.update: bus_display
+      - script.execute: fetch_lta_bus_arrivals
+
+esp32:
+  board: esp32dev
+  flash_size: 8MB
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+  logs:
+    http_request: WARN
+
+api:
+  reboot_timeout: 0s # Keep running standalone even without Home Assistant
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "BusBuddy-Fallback"
+    password: "busbuddy123"
+
+captive_portal:
+
+# Built-in Web UI at http://<device-ip>/
+# Total of 7 Web UI entities (3 buttons + 3 stop text fields + 1 light)
+# stays strictly under ESP32's 8-event SSE queue limit so every control renders.
+web_server:
+  port: 80
+  version: 3
+  local: true
+  sorting_groups:
+    - id: group_controls
+      name: "1. Bus Buddy Controls (Simulate Button Presses)"
+      sorting_weight: -20
+    - id: group_stops
+      name: "2. Saved Bus Stops (Format: 11541 - Stop Name)"
+      sorting_weight: -10
+    - id: group_display
+      name: "3. Display Settings"
+      sorting_weight: 10
+
+# Enable ESPHome JSON parser (required for json::parse_json in http_request)
+json:
+
+http_request:
+  useragent: "ESPHome-SG-BusBuddy/1.0"
+  timeout: 8s
+  verify_ssl: false
+
+# Sync Singapore Standard Time (UTC+8) for calculating arrival minutes
+time:
+  - platform: sntp
+    id: sgp_time
+    timezone: "Asia/Singapore"
+    servers:
+      - sg.pool.ntp.org
+      - pool.ntp.org
+
+# Global state for parsed bus arrivals, pagination & adaptive touch tracking
+globals:
+  - id: active_stop_index
+    type: int
+    restore_value: true
+    initial_value: '0'
+  - id: active_page_index
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: service_count
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: last_updated_str
+    type: std::string
+    restore_value: false
+    initial_value: '"Syncing..."'
+  # Adaptive Capacitive Touch state variables
+  - id: touch_baseline
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: touch_is_pressed
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: touch_debounce_cnt
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: touch_press_start_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: touch_long_fired
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # Arrays storing up to 18 bus services (up to 6 pages of 3 buses) for the active stop
+  - id: bus_no
+    type: std::string[18]
+  - id: eta1_str
+    type: std::string[18]
+  - id: eta2_str
+    type: std::string[18]
+  - id: eta3_str
+    type: std::string[18]
+  - id: load1_code
+    type: int[18] # 0=SEA (Green), 1=SDA (Amber), 2=LSD (Red)
+  - id: load2_code
+    type: int[18]
+  - id: deck1_str
+    type: std::string[18]
+  - id: deck2_str
+    type: std::string[18]
+
+# Group 1: Web UI Simulation & Control Buttons
+button:
+  - platform: template
+    id: btn_sim_short_press
+    name: "Cycle Buses in Stop (Short Press)"
+    web_server:
+      sorting_group_id: group_controls
+      sorting_weight: -10
+    on_press:
+      - lambda: |-
+          ESP_LOGI("touch_btn", "Web UI Button -> Simulated SHORT PRESS (Next Page of 3 Buses)");
+      - script.execute: cycle_next_bus
+
+  - platform: template
+    id: btn_sim_long_press
+    name: "Switch Bus Stop (Long Press)"
+    web_server:
+      sorting_group_id: group_controls
+      sorting_weight: -9
+    on_press:
+      - lambda: |-
+          ESP_LOGI("touch_btn", "Web UI Button -> Simulated LONG PRESS (Switch Bus Stop)");
+      - script.execute: cycle_next_stop
+
+  - platform: template
+    id: btn_refresh_now
+    name: "Refresh Bus Timings Now"
+    web_server:
+      sorting_group_id: group_controls
+      sorting_weight: -8
+    on_press:
+      - lambda: |-
+          ESP_LOGI("lta_api", "Web UI Button -> Manual LTA API Refresh triggered");
+      - script.execute: fetch_lta_bus_arrivals
+
+# Group 2: Editable & Persistently Saved Bus Stops ("Code - Label")
+text:
+  - platform: template
+    id: bus_stop_1_cfg
+    name: "Bus Stop 1 (Code - Name)"
+    optimistic: true
+    restore_value: true
+    initial_value: "${default_stop_1}"
+    mode: text
+    web_server:
+      sorting_group_id: group_stops
+      sorting_weight: 1
+    on_value:
+      then:
+        - lambda: |-
+            ESP_LOGI("lta_api", "Saved Bus Stop 1 -> '%s'", x.c_str());
+            if (id(active_stop_index) == 0) {
+              id(fetch_lta_bus_arrivals).execute();
+            }
+
+  - platform: template
+    id: bus_stop_2_cfg
+    name: "Bus Stop 2 (Code - Name)"
+    optimistic: true
+    restore_value: true
+    initial_value: "${default_stop_2}"
+    mode: text
+    web_server:
+      sorting_group_id: group_stops
+      sorting_weight: 2
+    on_value:
+      then:
+        - lambda: |-
+            ESP_LOGI("lta_api", "Saved Bus Stop 2 -> '%s'", x.c_str());
+            if (id(active_stop_index) == 1) {
+              id(fetch_lta_bus_arrivals).execute();
+            }
+
+  - platform: template
+    id: bus_stop_3_cfg
+    name: "Bus Stop 3 (Code - Name)"
+    optimistic: true
+    restore_value: true
+    initial_value: "${default_stop_3}"
+    mode: text
+    web_server:
+      sorting_group_id: group_stops
+      sorting_weight: 3
+    on_value:
+      then:
+        - lambda: |-
+            ESP_LOGI("lta_api", "Saved Bus Stop 3 -> '%s'", x.c_str());
+            if (id(active_stop_index) == 2) {
+              id(fetch_lta_bus_arrivals).execute();
+            }
+
+# Top Capacitive Touch Button Hardware Hub (GPIO32 / Touch T9)
+esp32_touch:
+  setup_mode: false
+  iir_filter: 10ms
+
+binary_sensor:
+  - platform: esp32_touch
+    id: top_touch_pad
+    pin: GPIO32
+    threshold: 1450
+    internal: true
+
+# Backlight on GPIO25 (Active-Low / Inverted PWM)
+output:
+  - platform: ledc
+    id: backlight_pwm
+    pin: GPIO25
+    inverted: true
+    frequency: 1000Hz
+
+light:
+  - platform: monochromatic
+    id: backlight
+    name: "Display Backlight"
+    output: backlight_pwm
+    restore_mode: ALWAYS_ON
+    web_server:
+      sorting_group_id: group_display
+      sorting_weight: 10
+
+# Hardware SPI for GeekMagic SmallTV Pro ST7789V 240x240 TFT
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO23
+  interface: hardware
+  id: spi_tft
+
+font:
+  # Hero fonts for Single-Bus View (service_count == 1)
+  - file: "gfonts://Roboto@700"
+    id: font_hero_eta1
+    size: 44
+    glyphs: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz- "
+  - file: "gfonts://Roboto@700"
+    id: font_hero_bus
+    size: 38
+    glyphs: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz- "
+  - file: "gfonts://Roboto@700"
+    id: font_hero_eta2
+    size: 34
+    glyphs: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz- "
+  # Multi-bus 3-per-page fonts (service_count >= 2)
+  - file: "gfonts://Roboto@700"
+    id: font_bus_no
+    size: 28
+  - file: "gfonts://Roboto@700"
+    id: font_eta_main
+    size: 26
+  - file: "gfonts://Roboto@700"
+    id: font_header
+    size: 18
+  - file: "gfonts://Roboto@700"
+    id: font_eta_sub
+    size: 18
+  - file: "gfonts://Roboto@400"
+    id: font_small
+    size: 13
+
+color:
+  - id: c_bg
+    hex: "0F172A"
+  - id: c_header_bg
+    hex: "1E293B"
+  - id: c_card_bg
+    hex: "1E293B"
+  - id: c_card_selected
+    hex: "334155"
+  - id: c_white
+    hex: "F8FAFC"
+  - id: c_muted
+    hex: "94A3B8"
+  - id: c_accent
+    hex: "38BDF8"
+  - id: c_sea_green
+    hex: "22C55E" # Seats Available (SEA)
+  - id: c_sda_amber
+    hex: "F59E0B" # Standing Available (SDA)
+  - id: c_lsd_red
+    hex: "EF4444" # Limited Standing (LSD)
+
+interval:
+  # 1. Adaptive Capacitive Touch Polling & Debounce (every 40ms)
+  - interval: 40ms
+    then:
+      - lambda: |-
+          uint32_t raw = id(top_touch_pad).get_value();
+          if (raw == 0 || raw > 4000) return;
+
+          // Initialize baseline on first valid reading after boot
+          if (id(touch_baseline) == 0) {
+            id(touch_baseline) = (int)raw;
+            ESP_LOGI("touch_btn", "Touch baseline calibrated: raw=%u (trigger below %d)",
+                     raw, id(touch_baseline) - 65);
+            return;
+          }
+
+          int trigger_thresh = id(touch_baseline) - 65;
+          int release_thresh = id(touch_baseline) - 35;
+          uint32_t now_ms = millis();
+
+          if (!id(touch_is_pressed)) {
+            if ((int)raw < trigger_thresh) {
+              id(touch_debounce_cnt) += 1;
+              if (id(touch_debounce_cnt) >= 2) { // Confirmed press (>= 80ms)
+                id(touch_is_pressed) = true;
+                id(touch_debounce_cnt) = 0;
+                id(touch_press_start_ms) = now_ms;
+                id(touch_long_fired) = false;
+                ESP_LOGI("touch_btn", "Top button PRESSED (raw=%u, baseline=%d, trigger<%d)",
+                         raw, id(touch_baseline), trigger_thresh);
+              }
+            } else {
+              id(touch_debounce_cnt) = 0;
+              // Gently track slow environmental drift when untouched
+              if (abs((int)raw - id(touch_baseline)) < 40) {
+                id(touch_baseline) = (id(touch_baseline) * 31 + (int)raw) / 32;
+              }
+            }
+          } else {
+            // While held down: fire Long Press immediately once held >= 650ms
+            uint32_t held_ms = now_ms - id(touch_press_start_ms);
+            if (!id(touch_long_fired) && held_ms >= 650) {
+              id(touch_long_fired) = true;
+              ESP_LOGI("touch_btn", "Top button LONG PRESS (%u ms, raw=%u) -> Switching bus stop",
+                       held_ms, raw);
+              id(cycle_next_stop).execute();
+            }
+
+            // Check for finger release (with hysteresis)
+            if ((int)raw > release_thresh) {
+              id(touch_debounce_cnt) += 1;
+              if (id(touch_debounce_cnt) >= 2) { // Confirmed release
+                id(touch_is_pressed) = false;
+                id(touch_debounce_cnt) = 0;
+                if (!id(touch_long_fired)) {
+                  ESP_LOGI("touch_btn", "Top button SHORT PRESS (%u ms, raw=%u) -> Next page of buses",
+                           held_ms, raw);
+                  id(cycle_next_bus).execute();
+                } else {
+                  ESP_LOGI("touch_btn", "Top button RELEASED after long press (%u ms, raw=%u)",
+                           held_ms, raw);
+                }
+              }
+            } else {
+              id(touch_debounce_cnt) = 0;
+            }
+          }
+
+  # 2. Poll LTA DataMall every 25 seconds
+  - interval: 25s
+    then:
+      - script.execute: fetch_lta_bus_arrivals
+
+script:
+  # Short press action: cycle across pages (3 bus services per page) within the current bus stop
+  - id: cycle_next_bus
+    mode: restart
+    then:
+      - lambda: |-
+          if (id(service_count) > 0) {
+            int total_pages = (id(service_count) + 2) / 3;
+            id(active_page_index) = (id(active_page_index) + 1) % total_pages;
+            int first_bus = id(active_page_index) * 3 + 1;
+            int last_bus = std::min(id(service_count), first_bus + 2);
+            ESP_LOGI("touch_btn", "Switched to Page %d/%d (showing buses %d-%d of %d)",
+                     id(active_page_index) + 1, total_pages, first_bus, last_bus, id(service_count));
+          } else {
+            id(active_page_index) = 0;
+            ESP_LOGI("touch_btn", "No active buses to paginate at current stop");
+          }
+      - component.update: bus_display
+
+  # Long press action: cycle across Bus Stops 1 -> 2 -> 3
+  - id: cycle_next_stop
+    mode: restart
+    then:
+      - lambda: |-
+          id(active_stop_index) = (id(active_stop_index) + 1) % 3;
+          id(active_page_index) = 0;
+          id(service_count) = 0;
+          id(last_updated_str) = "Loading...";
+          std::string raw_cfg = id(bus_stop_1_cfg).state;
+          if (id(active_stop_index) == 1) raw_cfg = id(bus_stop_2_cfg).state;
+          if (id(active_stop_index) == 2) raw_cfg = id(bus_stop_3_cfg).state;
+          ESP_LOGI("touch_btn", "Switched to Bus Stop %d/3: %s",
+                   id(active_stop_index) + 1, raw_cfg.c_str());
+      - component.update: bus_display
+      - script.execute: fetch_lta_bus_arrivals
+
+  - id: fetch_lta_bus_arrivals
+    mode: single
+    then:
+      - if:
+          condition:
+            wifi.connected:
+          then:
+            - http_request.get:
+                url: !lambda |-
+                  std::string raw_cfg = id(bus_stop_1_cfg).state;
+                  if (id(active_stop_index) == 1) raw_cfg = id(bus_stop_2_cfg).state;
+                  if (id(active_stop_index) == 2) raw_cfg = id(bus_stop_3_cfg).state;
+                  std::string code = raw_cfg.substr(0, 5);
+                  return "https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival?BusStopCode=" + code;
+                request_headers:
+                  AccountKey: !secret lta_account_key
+                  Accept: "application/json"
+                capture_response: true
+                max_response_buffer_size: 8192
+                on_error:
+                  then:
+                    - lambda: |-
+                        std::string raw_cfg = id(bus_stop_1_cfg).state;
+                        if (id(active_stop_index) == 1) raw_cfg = id(bus_stop_2_cfg).state;
+                        if (id(active_stop_index) == 2) raw_cfg = id(bus_stop_3_cfg).state;
+                        std::string code = raw_cfg.substr(0, 5);
+                        std::string path = "/ltaodataservice/v3/BusArrival?BusStopCode=" + code;
+                        ESP_LOGE("lta_api", "GET %s | status=ERROR | size=0 bytes", path.c_str());
+                        id(last_updated_str) = "API Err";
+                    - component.update: bus_display
+                on_response:
+                  then:
+                    - lambda: |-
+                        std::string raw_cfg = id(bus_stop_1_cfg).state;
+                        if (id(active_stop_index) == 1) raw_cfg = id(bus_stop_2_cfg).state;
+                        if (id(active_stop_index) == 2) raw_cfg = id(bus_stop_3_cfg).state;
+                        std::string code = raw_cfg.substr(0, 5);
+                        std::string path = "/ltaodataservice/v3/BusArrival?BusStopCode=" + code;
+
+                        // Log ONLY the HTTP path, response code, and response size in bytes to the Web UI debug log
+                        ESP_LOGI("lta_api", "GET %s | status=%d | size=%u bytes",
+                                 path.c_str(), response->status_code, (unsigned int)body.length());
+
+                        if (response->status_code != 200) {
+                          id(last_updated_str) = "HTTP " + std::to_string(response->status_code);
+                          return;
+                        }
+                        json::parse_json(body, [](JsonObject root) -> bool {
+                          JsonArray services = root["Services"].as<JsonArray>();
+                          if (services.isNull()) return false;
+
+                          auto now = id(sgp_time).now();
+                          time_t now_epoch = now.is_valid() ? now.timestamp : 0;
+
+                          // Helper to compute minutes from ISO8601 "YYYY-MM-DDTHH:MM:SS+08:00"
+                          auto calc_eta = [&](const char* iso_str) -> std::string {
+                            if (!iso_str || strlen(iso_str) < 19 || now_epoch == 0) return "-";
+                            struct tm t = {0};
+                            t.tm_year = atoi(iso_str) - 1900;
+                            t.tm_mon  = atoi(iso_str + 5) - 1;
+                            t.tm_mday = atoi(iso_str + 8);
+                            t.tm_hour = atoi(iso_str + 11);
+                            t.tm_min  = atoi(iso_str + 14);
+                            t.tm_sec  = atoi(iso_str + 17);
+                            time_t eta_epoch = mktime(&t);
+                            int diff_min = (int)((eta_epoch - now_epoch) / 60);
+                            if (diff_min <= 0) return "Arr";
+                            return std::to_string(diff_min) + "m";
+                          };
+
+                          auto parse_load = [](const char* load_str) -> int {
+                            if (!load_str) return 0;
+                            if (strcmp(load_str, "SDA") == 0) return 1;
+                            if (strcmp(load_str, "LSD") == 0) return 2;
+                            return 0; // Default SEA
+                          };
+
+                          int idx = 0;
+                          for (JsonObject svc : services) {
+                            if (idx >= 18) break;
+                            id(bus_no)[idx] = svc["ServiceNo"] | "?";
+
+                            JsonObject nb1 = svc["NextBus"];
+                            JsonObject nb2 = svc["NextBus2"];
+                            JsonObject nb3 = svc["NextBus3"];
+
+                            id(eta1_str)[idx]   = calc_eta(nb1["EstimatedArrival"]);
+                            id(eta2_str)[idx]   = calc_eta(nb2["EstimatedArrival"]);
+                            id(eta3_str)[idx]   = calc_eta(nb3["EstimatedArrival"]);
+                            id(load1_code)[idx] = parse_load(nb1["Load"]);
+                            id(load2_code)[idx] = parse_load(nb2["Load"]);
+                            id(deck1_str)[idx]  = nb1["Type"] | "SD";
+                            id(deck2_str)[idx]  = nb2["Type"] | "SD";
+                            idx++;
+                          }
+                          id(service_count) = idx;
+                          int total_pages = (idx + 2) / 3;
+                          if (total_pages == 0 || id(active_page_index) >= total_pages) {
+                            id(active_page_index) = 0;
+                          }
+                          if (now.is_valid()) {
+                            char buf[16];
+                            snprintf(buf, sizeof(buf), "%02d:%02d", now.hour, now.minute);
+                            id(last_updated_str) = std::string(buf);
+                          } else {
+                            id(last_updated_str) = "OK";
+                          }
+                          return true;
+                        });
+                    - component.update: bus_display
+
+# ST7789V 240x240 Display Configuration (SPI Mode 3, No CS pin)
+display:
+  - platform: mipi_spi
+    id: bus_display
+    model: ST7789V
+    spi_id: spi_tft
+    dc_pin: GPIO02
+    reset_pin: GPIO04
+    dimensions:
+      width: 240
+      height: 240
+      offset_width: 0
+      offset_height: 0
+    invert_colors: true
+    color_depth: 8
+    color_order: BGR
+    spi_mode: MODE3
+    data_rate: 40MHz
+    auto_clear_enabled: false
+    update_interval: 15s
+    lambda: |-
+      it.fill(id(c_bg));
+
+      // Parse "11541 - Opp Queens" into code ("11541") and name ("Opp Queens")
+      it.filled_rectangle(0, 0, 240, 38, id(c_header_bg));
+      std::string raw_cfg = id(bus_stop_1_cfg).state;
+      if (id(active_stop_index) == 1) raw_cfg = id(bus_stop_2_cfg).state;
+      if (id(active_stop_index) == 2) raw_cfg = id(bus_stop_3_cfg).state;
+
+      std::string stop_code = raw_cfg.length() >= 5 ? raw_cfg.substr(0, 5) : raw_cfg;
+      std::string stop_name = stop_code;
+      size_t dash_pos = raw_cfg.find('-');
+      if (dash_pos != std::string::npos && dash_pos + 1 < raw_cfg.length()) {
+        stop_name = raw_cfg.substr(dash_pos + 1);
+        while (!stop_name.empty() && stop_name[0] == ' ') stop_name.erase(0, 1);
+      }
+
+      it.printf(8, 3, id(font_header), id(c_accent), "%s", stop_name.c_str());
+      it.printf(232, 4, id(font_small), id(c_white), TextAlign::TOP_RIGHT, "%s", id(last_updated_str).c_str());
+
+      if (id(service_count) == 0) {
+        it.printf(8, 22, id(font_small), id(c_muted), "#%s [Stop %d/3]", stop_code.c_str(), id(active_stop_index) + 1);
+        it.printf(120, 120, id(font_header), id(c_muted), TextAlign::CENTER, "No buses in service");
+        it.printf(120, 145, id(font_small), id(c_muted), TextAlign::CENTER, "Hold button to switch stop");
+        return;
+      }
+
+      // =========================================================================
+      // MODE 1: SINGLE-BUS HERO LAYOUT (when only 1 bus service is at the stop)
+      // Rearranged with giant fonts (38pt Bus No, 44pt 1st ETA, 34pt 2nd ETA)
+      // so it is effortless to read from across the room.
+      // =========================================================================
+      if (id(service_count) == 1) {
+        it.printf(8, 22, id(font_small), id(c_muted), "#%s [Stop %d/3]", stop_code.c_str(), id(active_stop_index) + 1);
+        it.printf(232, 22, id(font_small), id(c_accent), TextAlign::TOP_RIGHT, "1 Bus");
+
+        // Top Banner: Bus Service Number (38pt Bold) + Deck Type
+        it.filled_rectangle(8, 44, 224, 56, id(c_card_selected));
+        it.rectangle(8, 44, 224, 56, id(c_accent));
+        it.filled_rectangle(8, 44, 5, 56, id(c_accent));
+        it.printf(20, 62, id(font_small), id(c_muted), "BUS");
+        it.printf(54, 48, id(font_hero_bus), id(c_white), "%s", id(bus_no)[0].c_str());
+        it.printf(222, 60, id(font_header), id(c_accent), TextAlign::TOP_RIGHT, "%s", id(deck1_str)[0].c_str());
+
+        // Bottom Left Giant Card: 1st Arrival (Next Bus) in full load color
+        Color pill1_color = id(c_sea_green);
+        if (id(load1_code)[0] == 1) pill1_color = id(c_sda_amber);
+        if (id(load1_code)[0] == 2) pill1_color = id(c_lsd_red);
+
+        it.filled_rectangle(8, 108, 118, 124, pill1_color);
+        it.printf(67, 114, id(font_small), id(c_bg), TextAlign::TOP_CENTER, "NEXT BUS");
+        it.printf(67, 142, id(font_hero_eta1), id(c_bg), TextAlign::TOP_CENTER, "%s", id(eta1_str)[0].c_str());
+        it.printf(67, 208, id(font_small), id(c_bg), TextAlign::TOP_CENTER, "1st (%s)", id(deck1_str)[0].c_str());
+
+        // Bottom Right Giant Card: 2nd Arrival (Subsequent Bus) + 3rd ETA footer
+        Color eta2_color = id(c_sea_green);
+        if (id(load2_code)[0] == 1) eta2_color = id(c_sda_amber);
+        if (id(load2_code)[0] == 2) eta2_color = id(c_lsd_red);
+
+        it.filled_rectangle(132, 108, 100, 124, id(c_card_bg));
+        it.rectangle(132, 108, 100, 124, eta2_color);
+        it.filled_rectangle(132, 108, 100, 5, eta2_color);
+        it.printf(182, 117, id(font_small), id(c_muted), TextAlign::TOP_CENTER, "2ND BUS");
+        it.printf(182, 144, id(font_hero_eta2), eta2_color, TextAlign::TOP_CENTER, "%s", id(eta2_str)[0].c_str());
+        it.printf(182, 208, id(font_small), id(c_muted), TextAlign::TOP_CENTER, "3rd: %s", id(eta3_str)[0].c_str());
+        return;
+      }
+
+      // =========================================================================
+      // MODE 2: MULTI-BUS PAGINATED LAYOUT (2+ buses, 3 bus services per page)
+      // Short press cycles one full page (3 buses) at a time.
+      // =========================================================================
+      int total_pages = (id(service_count) + 2) / 3;
+      if (id(active_page_index) >= total_pages) id(active_page_index) = 0;
+
+      it.printf(8, 22, id(font_small), id(c_muted), "#%s [Stop %d/3]", stop_code.c_str(), id(active_stop_index) + 1);
+      it.printf(232, 22, id(font_small), id(c_accent), TextAlign::TOP_RIGHT, "Page %d/%d", id(active_page_index) + 1, total_pages);
+
+      int page_start = id(active_page_index) * 3;
+      for (int row = 0; row < 3; row++) {
+        int i = page_start + row;
+        if (i >= id(service_count)) break;
+
+        // 3 tall rows (58px card height + 6px spacing = 64px per row)
+        int y = 44 + (row * 64);
+        it.filled_rectangle(6, y, 228, 58, id(c_card_bg));
+        it.filled_rectangle(6, y, 4, 58, id(c_accent));
+
+        // Service Number (28pt Bold) + Deck Type below
+        it.printf(16, y + 6, id(font_bus_no), id(c_white), "%s", id(bus_no)[i].c_str());
+        it.printf(16, y + 38, id(font_small), id(c_muted), "%s", id(deck1_str)[i].c_str());
+
+        // NextBus 1 Pill (26pt Bold) with Load Color (SEA=Green, SDA=Amber, LSD=Red)
+        Color pill1_color = id(c_sea_green);
+        if (id(load1_code)[i] == 1) pill1_color = id(c_sda_amber);
+        if (id(load1_code)[i] == 2) pill1_color = id(c_lsd_red);
+
+        it.filled_rectangle(96, y + 7, 72, 44, pill1_color);
+        it.printf(132, y + 14, id(font_eta_main), id(c_bg), TextAlign::TOP_CENTER, "%s", id(eta1_str)[i].c_str());
+
+        // NextBus 2 (18pt Bold) & NextBus 3 (13pt) stacked on the right
+        Color eta2_color = id(c_sea_green);
+        if (id(load2_code)[i] == 1) eta2_color = id(c_sda_amber);
+        if (id(load2_code)[i] == 2) eta2_color = id(c_lsd_red);
+
+        it.printf(202, y + 8, id(font_eta_sub), eta2_color, TextAlign::TOP_CENTER, "%s", id(eta2_str)[i].c_str());
+        it.printf(202, y + 34, id(font_small), id(c_muted), TextAlign::TOP_CENTER, "%s", id(eta3_str)[i].c_str());
+      }

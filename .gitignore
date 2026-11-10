@@ -1,0 +1,7 @@
+/.esphome/
+secrets.yaml
+*.swp
+.esphome
+*.egg-info
+.DS_Store
+assets/
